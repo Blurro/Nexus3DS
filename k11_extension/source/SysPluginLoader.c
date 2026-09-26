@@ -198,19 +198,18 @@ static bool SP_ReadExact(
 }
 
 static bool SP_ReadRelocPair(
-    const SysPluginHost *host,
-    Handle file,
-    u32 ptrDataStart,
+    const u8 *ptrData,
     u32 pluginPtrSize,
     u32 *totalRead,
     u32 out[2]
 )
 {
-    if (pluginPtrSize - *totalRead < 8)
+    if (*totalRead > pluginPtrSize || pluginPtrSize - *totalRead < 8)
         return false;
 
-    if (!SP_ReadExact(host, file, ptrDataStart + *totalRead, out, 8))
-        return false;
+    const u32 *pair = (const u32 *)(ptrData + *totalRead);
+    out[0] = pair[0];
+    out[1] = pair[1];
 
     *totalRead += 8;
     return true;
@@ -708,7 +707,8 @@ static bool SP_RelocatePlugin(
     SysPlugin *plugins,
     u32 pluginCount,
     u32 pluginIndex,
-    bool optionalPass
+    bool optionalPass,
+    u8 *ptrData
 )
 {
     SysPlugin *plugin = &plugins[pluginIndex];
@@ -716,11 +716,12 @@ static bool SP_RelocatePlugin(
     Handle file;
     u32 ptrDataStart = plugin->fileOffset + PLUGIN_HEADER_SIZE;
     u32 totalRead = 0;
-    bool failed = false;
+    bool failed;
 
     SP_MakePluginPath(plugin->name, path);
     if (SP_FAILED(host->FSUSER_OpenFile(&file, archive, SP_MakeAsciiPath(path), FS_OPEN_READ, 0)))
         return false;
+    failed = !SP_ReadExact(host, file, ptrDataStart, ptrData, plugin->pluginPtrSize);
 
     while (totalRead < plugin->pluginPtrSize && !failed)
     {
@@ -730,7 +731,8 @@ static bool SP_RelocatePlugin(
         bool selfReference = false;
         bool managedDependency = false;
 
-        if (!SP_ReadRelocPair(host, file, ptrDataStart, plugin->pluginPtrSize, &totalRead, group))
+        if (!SP_ReadRelocPair(ptrData, plugin->pluginPtrSize, &totalRead, group) ||
+            group[1] > (plugin->pluginPtrSize - totalRead) / 8)
         {
             failed = true;
             break;
@@ -761,7 +763,7 @@ static bool SP_RelocatePlugin(
             u32 pair[2];
             bool patch = optionalPass ? (!selfReference && !managedDependency) : (selfReference || managedDependency);
 
-            if (!SP_ReadRelocPair(host, file, ptrDataStart, plugin->pluginPtrSize, &totalRead, pair) ||
+            if (!SP_ReadRelocPair(ptrData, plugin->pluginPtrSize, &totalRead, pair) ||
                 pair[0] > plugin->totalSize - 4)
             {
                 failed = true;
@@ -804,6 +806,8 @@ Result SysPluginLoader_Main(
     char emptyPathData[1];
     SysPlugin *plugins;
     u32 workspaceAddress = 0;
+    u32 relocScratchAddress = 0;
+    u32 relocScratchSize = 0;
     u32 pluginCount = 0;
     Handle selfProcess = 0;
 
@@ -1014,7 +1018,16 @@ Result SysPluginLoader_Main(
 
 
         plugin->loaded = 1;
+        if (plugin->pluginPtrSize > relocScratchSize)
+            relocScratchSize = plugin->pluginPtrSize;
         host->FSFILE_Close(file);
+    }
+
+    if (relocScratchSize &&
+        (relocScratchSize > 0xFFFFF000u ||
+         SP_FAILED(SP_AllocPages(relocScratchSize, rangeLow, rangeHigh, downward, &relocScratchAddress))))
+    {
+        relocScratchAddress = 0;
     }
 
     // Resolve managed refs first, prune failures, then fill author-managed refs from final survivors.
@@ -1027,11 +1040,17 @@ Result SysPluginLoader_Main(
                 continue;
             if (pass)
                 plugin->reserved[0] = 0;
-            if (!SP_RelocatePlugin(host, archive, plugins, pluginCount, pluginIndex, pass != 0))
+            if (!relocScratchAddress ||
+                !SP_RelocatePlugin(
+                    host, archive, plugins, pluginCount, pluginIndex, pass != 0,
+                    (u8 *)relocScratchAddress))
                 SP_DiscardPlugin(plugin, 0);
         }
         SP_PropagateFailures(plugins, pluginCount, 0);
     }
+
+    if (relocScratchAddress)
+        (void)SP_FreePages(relocScratchAddress, relocScratchSize);
 
     {
         bool haveExecutablePlugin = false;
