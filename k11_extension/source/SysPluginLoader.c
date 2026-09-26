@@ -6,7 +6,7 @@
 #define PLUGIN_HEADER_SIZE       0x30u
 #define SYSPLUGIN_3NR_PAIR_OFF   0x04u
 #define SYSPLUGIN_NAME_SIZE      256u
-#define SP_DIR_BATCH_COUNT       8u
+#define SP_DIR_BATCH_COUNT       4u
 #define ARCHIVE_SDMC             0x00000009u
 #define FS_OPEN_READ             1u
 
@@ -418,12 +418,13 @@ static void SP_AddPluginEntry(
     plugins[pos].pluginBssSize = header->pluginBssSize;
 }
 
-__attribute__((always_inline)) static inline bool SP_ScanPlugins(
+static bool SP_ScanPlugins(
     const SysPluginHost *host,
     SysPlgArchive archive,
     u32 pluginMagic,
     SysPlugin *plugins,
-    u32 *pluginCount
+    u32 *pluginCount,
+    SysPlgDirectoryEntry *entries
 )
 {
     char directoryPath[14];
@@ -444,7 +445,6 @@ __attribute__((always_inline)) static inline bool SP_ScanPlugins(
 
     while (1)
     {
-        SysPlgDirectoryEntry entries[SP_DIR_BATCH_COUNT];
         u32 entriesRead = 0;
 
         if (SP_FAILED(host->FSDIR_Read(directory, &entriesRead, SP_DIR_BATCH_COUNT, entries)) || !entriesRead)
@@ -793,11 +793,14 @@ Result SysPluginLoader_Main(
 )
 {
     const bool downward = pluginMagic == LOADER_PLUGIN_MAGIC;
-    const u32 workspaceSize = sizeof(SysPlugin) * SYSPLUGIN_MAX_PLUGINS;
+    const u32 pluginTableSize = sizeof(SysPlugin) * SYSPLUGIN_MAX_PLUGINS;
+    const u32 directoryEntriesOffset = (pluginTableSize + 7u) & ~7u;
+    const u32 workspaceSize = directoryEntriesOffset + sizeof(SysPlgDirectoryEntry) * SP_DIR_BATCH_COUNT;
     SysPlgArchive archive = 0;
     SysPlgPath emptyPath;
     char emptyPathData[1];
     SysPlugin *plugins;
+    SysPlgDirectoryEntry *directoryEntries;
     u32 workspaceAddress = 0;
     u32 scratchAddress = 0;
     u32 scratchSize = 0;
@@ -826,6 +829,7 @@ Result SysPluginLoader_Main(
     }
 
     plugins = (SysPlugin *)workspaceAddress;
+    directoryEntries = (SysPlgDirectoryEntry *)(workspaceAddress + directoryEntriesOffset);
 
     emptyPathData[0] = 0;
     emptyPath.type = SYSPLG_PATH_EMPTY;
@@ -838,7 +842,7 @@ Result SysPluginLoader_Main(
         return SP_Unlock(SP_FAILED(freeResult) ? freeResult : 0);
     }
 
-    if (!SP_ScanPlugins(host, archive, pluginMagic, plugins, &pluginCount))
+    if (!SP_ScanPlugins(host, archive, pluginMagic, plugins, &pluginCount, directoryEntries))
     {
         host->FSUSER_CloseArchive(archive);
         return SP_Unlock(SP_FreePages(workspaceAddress, workspaceSize));
