@@ -1,10 +1,12 @@
 #include "SysPluginLoader.h"
 #include "svc/SysPlugin3nrGenerated.h"
 #include "sysplugin_entry.h"
+#include <string.h>
 
 #define PLUGIN_HEADER_SIZE       0x30u
 #define SYSPLUGIN_3NR_PAIR_OFF   0x04u
 #define SYSPLUGIN_NAME_SIZE      256u
+#define SP_DIR_BATCH_COUNT       8u
 #define ARCHIVE_SDMC             0x00000009u
 #define FS_OPEN_READ             1u
 
@@ -398,14 +400,7 @@ static void SP_AddPluginEntry(
 
     while (pos > 0 && SP_PluginEntryEarlier(&plugins[pos - 1], name, priority, fileOffset))
     {
-        SP_CopyString(plugins[pos].name, plugins[pos - 1].name);
-        plugins[pos].priority = plugins[pos - 1].priority;
-        plugins[pos].fileOffset = plugins[pos - 1].fileOffset;
-        plugins[pos].plgid = plugins[pos - 1].plgid;
-        plugins[pos].allocatedAddr = plugins[pos - 1].allocatedAddr;
-        plugins[pos].totalSize = plugins[pos - 1].totalSize;
-        plugins[pos].codeSize = plugins[pos - 1].codeSize;
-        plugins[pos].mainAddr = plugins[pos - 1].mainAddr;
+        plugins[pos] = plugins[pos - 1];
         pos--;
     }
 
@@ -416,10 +411,14 @@ static void SP_AddPluginEntry(
     plugins[pos].allocatedAddr = header->abiLo;
     plugins[pos].totalSize = header->abiHi;
     plugins[pos].codeSize = header->expectedEnvLo;
+    plugins[pos].pluginPtrSize = header->pluginPtrSize;
     plugins[pos].mainAddr = header->expectedEnvHi;
+    plugins[pos].pluginCodeSize = header->pluginCodeSize;
+    plugins[pos].pluginDataSize = header->pluginDataSize;
+    plugins[pos].pluginBssSize = header->pluginBssSize;
 }
 
-static bool SP_ScanPlugins(
+__attribute__((always_inline)) static inline bool SP_ScanPlugins(
     const SysPluginHost *host,
     SysPlgArchive archive,
     u32 pluginMagic,
@@ -445,123 +444,128 @@ static bool SP_ScanPlugins(
 
     while (1)
     {
-        SysPlgDirectoryEntry entry;
+        SysPlgDirectoryEntry entries[SP_DIR_BATCH_COUNT];
         u32 entriesRead = 0;
-        char name[SYSPLUGIN_NAME_SIZE];
-        u32 length = 0;
-        char path[272];
-        Handle file;
 
-        if (SP_FAILED(host->FSDIR_Read(directory, &entriesRead, 1, &entry)) || !entriesRead)
+        if (SP_FAILED(host->FSDIR_Read(directory, &entriesRead, SP_DIR_BATCH_COUNT, entries)) || !entriesRead)
             break;
 
-        while (length + 1 < sizeof(name) && entry.name[length])
+        for (u32 entryIndex = 0; entryIndex < entriesRead; entryIndex++)
         {
-            name[length] = (char)entry.name[length];
-            length++;
-        }
-        name[length] = 0;
+            SysPlgDirectoryEntry *entry = &entries[entryIndex];
+            char name[SYSPLUGIN_NAME_SIZE];
+            u32 length = 0;
+            char path[272];
+            Handle file;
 
-        if (length < 7 ||
-            name[length - 4] != '.' ||
-            name[length - 3] != '3' ||
-            name[length - 2] != 'n' ||
-            name[length - 1] != 'x')
-        {
-            continue;
-        }
-
-        {
-            char *extension = &name[length - 4];
-            char *priorityDot = extension - 1;
-            u32 priority = 0;
-            bool valid = true;
-
-            while (priorityDot > name && *priorityDot != '.')
-                priorityDot--;
-
-            if (*priorityDot != '.' || priorityDot + 1 == extension)
-                continue;
-
-            for (char *character = priorityDot + 1; character < extension; character++)
+            while (length + 1 < sizeof(name) && entry->name[length])
             {
-                u32 digit;
-
-                if (*character < '0' || *character > '9')
-                {
-                    valid = false;
-                    break;
-                }
-
-                digit = (u32)(*character - '0');
-
-                if (priority > (0xFFFFFFFFu - digit) / 10u)
-                {
-                    valid = false;
-                    break;
-                }
-
-                priority = priority * 10u + digit;
+                name[length] = (char)entry->name[length];
+                length++;
             }
+            name[length] = 0;
 
-            if (!valid)
-                continue;
-
-            SP_MakePluginPath(name, path);
-
-            if (SP_FAILED(host->FSUSER_OpenFile(
-                &file,
-                archive,
-                SP_MakeAsciiPath(path),
-                FS_OPEN_READ,
-                0
-            )))
+            if (length < 7 ||
+                name[length - 4] != '.' ||
+                name[length - 3] != '3' ||
+                name[length - 2] != 'n' ||
+                name[length - 1] != 'x')
             {
                 continue;
             }
 
             {
-                u32 fileOffset = 0;
+                char *extension = &name[length - 4];
+                char *priorityDot = extension - 1;
+                u32 priority = 0;
+                bool valid = true;
 
-                while (1)
+                while (priorityDot > name && *priorityDot != '.')
+                    priorityDot--;
+
+                if (*priorityDot != '.' || priorityDot + 1 == extension)
+                    continue;
+
+                for (char *character = priorityDot + 1; character < extension; character++)
                 {
-                    SysPluginHeader header;
-                    u32 nextOffset;
+                    u32 digit;
 
-                    if (!SP_ReadHeader(
-                        host,
-                        file,
-                        fileOffset,
-                        &header,
-                        &nextOffset
-                    ))
+                    if (*character < '0' || *character > '9')
                     {
+                        valid = false;
                         break;
                     }
 
-                    if (header.magic != ROSALINA_PLUGIN_MAGIC &&
-                        header.magic != LOADER_PLUGIN_MAGIC)
+                    digit = (u32)(*character - '0');
+
+                    if (priority > (0xFFFFFFFFu - digit) / 10u)
                     {
+                        valid = false;
                         break;
                     }
 
-                    if (header.magic == pluginMagic)
+                    priority = priority * 10u + digit;
+                }
+
+                if (!valid)
+                    continue;
+
+                SP_MakePluginPath(name, path);
+
+                if (SP_FAILED(host->FSUSER_OpenFile(
+                    &file,
+                    archive,
+                    SP_MakeAsciiPath(path),
+                    FS_OPEN_READ,
+                    0
+                )))
+                {
+                    continue;
+                }
+
+                {
+                    u32 fileOffset = 0;
+
+                    while (1)
                     {
-                        SP_AddPluginEntry(
-                            plugins,
-                            pluginCount,
-                            name,
-                            priority,
+                        SysPluginHeader header;
+                        u32 nextOffset;
+
+                        if (!SP_ReadHeader(
+                            host,
+                            file,
                             fileOffset,
-                            &header
-                        );
+                            &header,
+                            &nextOffset
+                        ))
+                        {
+                            break;
+                        }
+
+                        if (header.magic != ROSALINA_PLUGIN_MAGIC &&
+                            header.magic != LOADER_PLUGIN_MAGIC)
+                        {
+                            break;
+                        }
+
+                        if (header.magic == pluginMagic)
+                        {
+                            SP_AddPluginEntry(
+                                plugins,
+                                pluginCount,
+                                name,
+                                priority,
+                                fileOffset,
+                                &header
+                            );
+                        }
+
+                        fileOffset = nextOffset;
                     }
-
-                    fileOffset = nextOffset;
                 }
-            }
 
-            host->FSFILE_Close(file);
+                host->FSFILE_Close(file);
+            }
         }
     }
 
@@ -702,26 +706,16 @@ static void SP_PropagateFailures(
 }
 
 static bool SP_RelocatePlugin(
-    const SysPluginHost *host,
-    SysPlgArchive archive,
     SysPlugin *plugins,
     u32 pluginCount,
     u32 pluginIndex,
     bool optionalPass,
-    u8 *ptrData
+    const u8 *ptrData
 )
 {
     SysPlugin *plugin = &plugins[pluginIndex];
-    char path[272];
-    Handle file;
-    u32 ptrDataStart = plugin->fileOffset + PLUGIN_HEADER_SIZE;
     u32 totalRead = 0;
-    bool failed;
-
-    SP_MakePluginPath(plugin->name, path);
-    if (SP_FAILED(host->FSUSER_OpenFile(&file, archive, SP_MakeAsciiPath(path), FS_OPEN_READ, 0)))
-        return false;
-    failed = !SP_ReadExact(host, file, ptrDataStart, ptrData, plugin->pluginPtrSize);
+    bool failed = false;
 
     while (totalRead < plugin->pluginPtrSize && !failed)
     {
@@ -787,7 +781,6 @@ static bool SP_RelocatePlugin(
         }
     }
 
-    host->FSFILE_Close(file);
     return !failed && totalRead == plugin->pluginPtrSize;
 }
 
@@ -806,8 +799,10 @@ Result SysPluginLoader_Main(
     char emptyPathData[1];
     SysPlugin *plugins;
     u32 workspaceAddress = 0;
-    u32 relocScratchAddress = 0;
-    u32 relocScratchSize = 0;
+    u32 scratchAddress = 0;
+    u32 scratchSize = 0;
+    u32 relocCacheSize = 0;
+    u32 payloadScratchSize = 0;
     u32 pluginCount = 0;
     Handle selfProcess = 0;
 
@@ -920,57 +915,36 @@ Result SysPluginLoader_Main(
 
     (void)SP_Unlock(0);
 
-    // load every image as RW
+    // allocate every image before temporary buffers
     for (u32 pluginIndex = 0; pluginIndex < pluginCount; pluginIndex++)
     {
         SysPlugin *plugin = &plugins[pluginIndex];
-        SysPluginHeader header;
         if (!plugin->plgid || (plugin->codeSize & 1u))
+        {
+            plugin->pluginPtrSize = 0;
             continue;
-        char path[272];
-        Handle file;
-        u32 payloadOffset;
-        u32 nextOffset;
+        }
         u32 codeSize;
         u32 dataAndBssSize;
         u32 dataSize;
         u32 totalSize;
+        u32 payloadSize;
+        u32 nextRelocCacheSize;
         u32 codeAddress = 0;
-        u32 dataAddress;
 
-        SP_MakePluginPath(plugin->name, path);
-
-        if (SP_FAILED(host->FSUSER_OpenFile(
-            &file,
-            archive,
-            SP_MakeAsciiPath(path),
-            FS_OPEN_READ,
-            0
-        )))
-        {
-            continue;
-        }
-
-        if (!SP_ReadHeader(
-                host,
-                file,
-                plugin->fileOffset,
-                &header,
-                &nextOffset
-            ) ||
-            header.magic != pluginMagic ||
-            header.plgid != plugin->plgid ||
-            !header.pluginCodeSize ||
-            !SP_AlignPageChecked(header.pluginCodeSize, &codeSize) ||
-            !SP_AddChecked(header.pluginDataSize, header.pluginBssSize, &dataAndBssSize) ||
+        if (!plugin->pluginCodeSize ||
+            !SP_AlignPageChecked(plugin->pluginCodeSize, &codeSize) ||
+            !SP_AddChecked(plugin->pluginDataSize, plugin->pluginBssSize, &dataAndBssSize) ||
             !SP_AlignPageChecked(dataAndBssSize, &dataSize) ||
-            !SP_AddChecked(codeSize, dataSize, &totalSize))
+            !SP_AddChecked(codeSize, dataSize, &totalSize) ||
+            !SP_AddChecked(plugin->pluginPtrSize, plugin->pluginCodeSize, &payloadSize) ||
+            !SP_AddChecked(payloadSize, plugin->pluginDataSize, &payloadSize) ||
+            (plugin->pluginPtrSize & 7u) ||
+            !SP_AddChecked(relocCacheSize, plugin->pluginPtrSize, &nextRelocCacheSize))
         {
-            host->FSFILE_Close(file);
+            plugin->pluginPtrSize = 0;
             continue;
         }
-
-        payloadOffset = plugin->fileOffset + PLUGIN_HEADER_SIZE;
 
         {
             Result allocResult = SP_AllocPages(
@@ -983,74 +957,128 @@ Result SysPluginLoader_Main(
 
             if (SP_FAILED(allocResult))
             {
-                host->FSFILE_Close(file);
+                plugin->pluginPtrSize = 0;
                 continue;
             }
         }
 
-        dataAddress = codeAddress + codeSize;
-
         plugin->allocatedAddr = codeAddress;
         plugin->totalSize = totalSize;
         plugin->codeSize = codeSize;
-        plugin->pluginPtrSize = header.pluginPtrSize;
         plugin->mainAddr = codeAddress;
-
-        if (!SP_ReadExact(
-                host,
-                file,
-                payloadOffset + header.pluginPtrSize,
-                (void *)codeAddress,
-                header.pluginCodeSize
-            ) ||
-            !SP_ReadExact(
-                host,
-                file,
-                payloadOffset + header.pluginPtrSize + header.pluginCodeSize,
-                (void *)dataAddress,
-                header.pluginDataSize
-            ))
-        {
-            host->FSFILE_Close(file);
-            SP_DiscardPlugin(plugin, 0);
-            continue;
-        }
-
-
         plugin->loaded = 1;
-        if (plugin->pluginPtrSize > relocScratchSize)
-            relocScratchSize = plugin->pluginPtrSize;
-        host->FSFILE_Close(file);
+        relocCacheSize = nextRelocCacheSize;
+        if (payloadSize > payloadScratchSize)
+            payloadScratchSize = payloadSize;
     }
 
-    if (relocScratchSize &&
-        (relocScratchSize > 0xFFFFF000u ||
-         SP_FAILED(SP_AllocPages(relocScratchSize, rangeLow, rangeHigh, downward, &relocScratchAddress))))
+    if (!SP_AddChecked(relocCacheSize, payloadScratchSize, &scratchSize) ||
+        scratchSize > 0xFFFFF000u ||
+        (scratchSize && SP_FAILED(SP_AllocPages(scratchSize, rangeLow, rangeHigh, downward, &scratchAddress))))
     {
-        relocScratchAddress = 0;
+        scratchAddress = 0;
+        for (u32 pluginIndex = 0; pluginIndex < pluginCount; pluginIndex++)
+        {
+            if (plugins[pluginIndex].loaded)
+                SP_DiscardPlugin(&plugins[pluginIndex], 0);
+        }
+    }
+
+    if (scratchAddress)
+    {
+        u32 relocOffset = 0;
+        u8 *payload = (u8 *)(scratchAddress + relocCacheSize);
+
+        for (u32 pluginIndex = 0; pluginIndex < pluginCount; pluginIndex++)
+        {
+            SysPlugin *plugin = &plugins[pluginIndex];
+            u8 *reloc = (u8 *)(scratchAddress + relocOffset);
+            SysPluginHeader header;
+            char path[272];
+            Handle file;
+            u32 payloadSize;
+            bool loaded;
+
+            relocOffset += plugin->pluginPtrSize;
+            if (!plugin->loaded)
+                continue;
+
+            SP_MakePluginPath(plugin->name, path);
+            if (SP_FAILED(host->FSUSER_OpenFile(
+                &file,
+                archive,
+                SP_MakeAsciiPath(path),
+                FS_OPEN_READ,
+                0
+            )))
+            {
+                SP_DiscardPlugin(plugin, 0);
+                continue;
+            }
+
+            loaded = SP_ReadHeader(
+                host,
+                file,
+                plugin->fileOffset,
+                &header,
+                &payloadSize
+            ) &&
+                header.magic == pluginMagic &&
+                header.plgid == plugin->plgid &&
+                header.pluginPtrSize == plugin->pluginPtrSize &&
+                header.pluginCodeSize == plugin->pluginCodeSize &&
+                header.pluginDataSize == plugin->pluginDataSize &&
+                header.pluginBssSize == plugin->pluginBssSize;
+            payloadSize = plugin->pluginPtrSize + plugin->pluginCodeSize + plugin->pluginDataSize;
+            loaded = loaded && SP_ReadExact(
+                host,
+                file,
+                plugin->fileOffset + PLUGIN_HEADER_SIZE,
+                payload,
+                payloadSize
+            );
+            host->FSFILE_Close(file);
+
+            if (!loaded)
+            {
+                SP_DiscardPlugin(plugin, 0);
+                continue;
+            }
+
+            memcpy(reloc, payload, plugin->pluginPtrSize);
+            memcpy((void *)plugin->allocatedAddr, payload + plugin->pluginPtrSize, plugin->pluginCodeSize);
+            memcpy(
+                (void *)(plugin->allocatedAddr + plugin->codeSize),
+                payload + plugin->pluginPtrSize + plugin->pluginCodeSize,
+                plugin->pluginDataSize
+            );
+        }
     }
 
     // Resolve managed refs first, prune failures, then fill author-managed refs from final survivors.
     for (u32 pass = 0; pass < 2; pass++)
     {
+        u32 relocOffset = 0;
+
         for (u32 pluginIndex = 0; pluginIndex < pluginCount; pluginIndex++)
         {
             SysPlugin *plugin = &plugins[pluginIndex];
+            const u8 *reloc = (const u8 *)(scratchAddress + relocOffset);
+
+            relocOffset += plugin->pluginPtrSize;
             if (!plugin->loaded || !plugin->pluginPtrSize || (pass && !plugin->reserved[0]))
                 continue;
             if (pass)
                 plugin->reserved[0] = 0;
-            if (!relocScratchAddress ||
-                !SP_RelocatePlugin(
-                    host, archive, plugins, pluginCount, pluginIndex, pass != 0,
-                    (u8 *)relocScratchAddress))
+            if (!SP_RelocatePlugin(
+                    plugins, pluginCount, pluginIndex, pass != 0, reloc))
                 SP_DiscardPlugin(plugin, 0);
         }
         SP_PropagateFailures(plugins, pluginCount, 0);
     }
 
-    if (relocScratchAddress)
-        (void)SP_FreePages(relocScratchAddress, relocScratchSize);
+    if (scratchAddress)
+        (void)SP_FreePages(scratchAddress, scratchSize);
 
     {
         bool haveExecutablePlugin = false;
