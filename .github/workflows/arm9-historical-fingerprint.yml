@@ -1,0 +1,61 @@
+name: ARM9 historical toolchain fingerprint
+
+on:
+  push:
+    branches:
+      - chatgpt-arm9-repro-temp
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tag: "20250512"
+            image: "devkitpro/devkitarm:20250512"
+          - tag: "20250527"
+            image: "devkitpro/devkitarm:20250527"
+          - tag: "20251231"
+            image: "devkitpro/devkitarm:20251231"
+          - tag: "20260221"
+            image: "devkitpro/devkitarm:20260221"
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Fetch exact Luma 13.4 source
+        shell: bash
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/LumaTeam/Luma3DS.git /tmp/luma
+          cd /tmp/luma
+          git checkout b3282131c4c091cfa9a57d59c1b6fc67f08a3a3f
+
+      - name: Build ARM9
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export DEVKITPRO=/opt/devkitpro
+          export DEVKITARM=/opt/devkitpro/devkitARM
+          export PATH="$DEVKITARM/bin:$PATH"
+          arm-none-eabi-gcc --version | head -1 | tee /tmp/compiler-${{ matrix.tag }}.txt
+          arm-none-eabi-ld --version | head -1 | tee -a /tmp/compiler-${{ matrix.tag }}.txt
+          cd /tmp/luma/arm9
+          make clean || true
+          make -j2 REVISION=v13.4 VERSION_MAJOR=13 VERSION_MINOR=4 VERSION_BUILD=0 COMMIT=b3282131 IS_RELEASE=1
+          arm-none-eabi-objcopy -O binary arm9.elf /tmp/arm9-${{ matrix.tag }}.bin
+          arm-none-eabi-nm -n -S arm9.elf > /tmp/arm9-${{ matrix.tag }}.nm
+          sha256sum /tmp/arm9-${{ matrix.tag }}.bin | tee /tmp/sha-${{ matrix.tag }}.txt
+          grep -E ' aes$| sha$' /tmp/arm9-${{ matrix.tag }}.nm | tee /tmp/aes-${{ matrix.tag }}.txt
+          stat -c '%s' /tmp/arm9-${{ matrix.tag }}.bin | tee -a /tmp/aes-${{ matrix.tag }}.txt
+
+      - name: Upload fingerprint
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm9-${{ matrix.tag }}
+          path: |
+            /tmp/arm9-${{ matrix.tag }}.bin
+            /tmp/arm9-${{ matrix.tag }}.nm
+            /tmp/compiler-${{ matrix.tag }}.txt
+            /tmp/sha-${{ matrix.tag }}.txt
+            /tmp/aes-${{ matrix.tag }}.txt
+          retention-days: 1
